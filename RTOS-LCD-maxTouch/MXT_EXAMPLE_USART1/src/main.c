@@ -91,6 +91,35 @@
 #include "conf_board.h"
 #include "conf_example.h"
 #include "conf_uart_serial.h"
+#include "tfont.h"
+#include "digital521.h"
+#include "soneca.h"
+#include "termometro.h"
+#include "ar.h"
+
+//Potenciomêtro
+#define POT_PIO           PIOD
+#define POT_PIO_ID        ID_PIOD
+#define POT_PIO_IDX       30
+#define POT_PIO_IDX_MASK  (1u << POT_PIO_IDX)
+
+//Botão2 OLED
+#define BUT_PIO				PIOC
+#define BUT_PIO_ID			ID_PIOC
+#define BUT_PIO_IDX			31
+#define BUT_PIO_IDX_MASK	(1u << BUT_PIO_IDX)
+
+//Botão3 OLED
+#define BUT1_PIO			PIOA
+#define BUT1_PIO_ID			ID_PIOA
+#define BUT1_PIO_IDX		19
+#define BUT1_PIO_IDX_MASK	(1u << BUT1_PIO_IDX)
+
+//Semáforos pare semerem usados pela task LCD
+
+SemaphoreHandle_t xSemaphore;
+
+SemaphoreHandle_t xSemaphore2;
 
 /************************************************************************/
 /* LCD + TOUCH                                                          */
@@ -278,9 +307,78 @@ static void mxt_init(struct mxt_device *device)
 /* funcoes                                                              */
 /************************************************************************/
 
+void but_callback(void){
+	printf("oi");
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
+}
+
+void but1_callback(void){
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	xSemaphoreGiveFromISR(xSemaphore2, &xHigherPriorityTaskWoken);
+}
+
+void io_init(void) {
+	pmc_enable_periph_clk(BUT_PIO_ID);
+	
+	// Configura PIO para lidar com o pino do botão como entrada
+	// com pull-up
+	pio_configure(BUT_PIO, PIO_INPUT, BUT_PIO_IDX_MASK, PIO_PULLUP | PIO_DEBOUNCE);
+
+	// Configura interrupção no pino referente ao botao e associa
+	// função de callback caso uma interrupção for gerada
+	// a função de callback é a: but_callback()
+	pio_handler_set(BUT_PIO,
+	BUT_PIO_ID,
+	BUT_PIO_IDX_MASK,
+	PIO_IT_FALL_EDGE,
+	but_callback);
+
+	// Ativa interrupção
+	pio_enable_interrupt(BUT_PIO, BUT_PIO_IDX_MASK);
+
+	// Configura NVIC para receber interrupcoes do PIO do botao
+	// com prioridade 4 (quanto mais próximo de 0 maior)
+	NVIC_EnableIRQ(BUT_PIO_ID);
+	NVIC_SetPriority(BUT_PIO_ID, 4); // Prioridade 4
+	
+	pmc_enable_periph_clk(BUT1_PIO_ID);
+	
+	// Configura PIO para lidar com o pino do botão como entrada
+	// com pull-up
+	pio_configure(BUT1_PIO, PIO_INPUT, BUT1_PIO_IDX_MASK, PIO_PULLUP | PIO_DEBOUNCE);
+
+	// Configura interrupção no pino referente ao botao e associa
+	// função de callback caso uma interrupção for gerada
+	// a função de callback é a: but_callback()
+	pio_handler_set(BUT1_PIO,
+	BUT1_PIO_ID,
+	BUT1_PIO_IDX_MASK,
+	PIO_IT_FALL_EDGE,
+	but1_callback);
+
+	// Ativa interrupção
+	pio_enable_interrupt(BUT1_PIO, BUT1_PIO_IDX_MASK);
+
+	// Configura NVIC para receber interrupcoes do PIO do botao
+	// com prioridade 4 (quanto mais próximo de 0 maior)
+	NVIC_EnableIRQ(BUT1_PIO_ID);
+	NVIC_SetPriority(BUT1_PIO_ID, 3); // Prioridade 4
+	
+}
 void draw_screen(void) {
 	ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
 	ili9488_draw_filled_rectangle(0, 0, ILI9488_LCD_WIDTH-1, ILI9488_LCD_HEIGHT-1);
+}
+
+void draw_line(void) {
+	ili9488_set_foreground_color(COLOR_CONVERT(COLOR_BLACK));
+	ili9488_draw_filled_rectangle(0, 100, ILI9488_LCD_WIDTH-1, 100);
+}
+
+void draw_icon(tImage icon, int x, int y){
+	ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
+	ili9488_draw_pixmap(x, y, icon.width, icon.height, icon.data);
 }
 
 void draw_button(uint32_t clicked) {
@@ -312,14 +410,29 @@ uint32_t convert_axis_system_y(uint32_t touch_x) {
 }
 
 void update_screen(uint32_t tx, uint32_t ty) {
-	if(tx >= BUTTON_X-BUTTON_W/2 && tx <= BUTTON_X + BUTTON_W/2) {
+	/*if(tx >= BUTTON_X-BUTTON_W/2 && tx <= BUTTON_X + BUTTON_W/2) {
 		if(ty >= BUTTON_Y-BUTTON_H/2 && ty <= BUTTON_Y) {
 			draw_button(1);
 		} else if(ty > BUTTON_Y && ty < BUTTON_Y + BUTTON_H/2) {
 			draw_button(0);
 		}
-	}
+	}*/
 }
+
+void font_draw_text(tFont *font, const char *text, int x, int y, int spacing) {
+  char *p = text;
+  while(*p != NULL) {
+    char letter = *p;
+    int letter_offset = letter - font->start_char;
+    if(letter <= font->end_char) {
+      tChar *current_char = font->chars + letter_offset;
+      ili9488_draw_pixmap(x, y, current_char->image->width, current_char->image->height, current_char->image->data);
+      x += current_char->image->width + spacing;
+    }
+    p++;
+  }
+}
+
 
 void mxt_handler(struct mxt_device *device, uint *x, uint *y)
 {
@@ -382,11 +495,23 @@ void task_lcd(void){
   xQueueTouch = xQueueCreate( 10, sizeof( touchData ) );
 	configure_lcd();
   
+  io_init();
+  
   draw_screen();
-  draw_button(0);
+    
+  // Escreve HH:MM no LCD
+  font_draw_text(&digital52, "HH:MM", 20, 20, 1);
+  draw_icon(soneca, ILI9488_LCD_WIDTH-110,20);
+  draw_icon(termometro, 80, 120);
+  draw_icon(ar , 80, 270);
+  draw_line();
+  
   touchData touch;
     
   while (true) {  
+	 if( xSemaphoreTake(xSemaphore, ( TickType_t )  500 / portTICK_PERIOD_MS) == pdTRUE) {
+		 printf("Chora");
+	 }
      if (xQueueReceive( xQueueTouch, &(touch), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
        update_screen(touch.x, touch.y);
        printf("x:%d y:%d\n", touch.x, touch.y);
